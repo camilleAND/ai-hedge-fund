@@ -111,6 +111,26 @@ You can optionally specify the start and end dates to make decisions for a speci
 poetry run python src/main.py --ticker AAPL,MSFT,NVDA --start-date 2024-01-01 --end-date 2024-03-01 
 ```
 
+### 3 modes
+#### Interactive
+```bash
+uv run src/main.py --ticker AAPL,MSFT,NVDA --show-reasoning
+```
+You can optionally specify the start and end dates to make decisions for a specific time period.
+
+```bash
+uv run src/main.py --ticker AAPL,MSFT,NVDA --start-date 2024-01-01 --end-date 2024-03-01 
+```
+
+#### Script .json file
+```bash
+uv run src/main.py --script --config config.json
+```
+
+#### Full cli
+```bash
+uv run  src/main.py --non-interactive --tickers "AAPL,MSFT,GOOGL" --analysts "warren_buffett,charlie_munger,technical_analyst" --model "gpt-4o" --start-date "2023-01-01" --end-date "2023-12-31" --initial-cash 200000 --margin-requirement 0.1 --show-reasoning
+```
 ### Running the Backtester
 
 ```bash
@@ -164,3 +184,4 @@ If you have a feature request, please open an [issue](https://github.com/virattt
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+

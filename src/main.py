@@ -216,12 +216,31 @@ if __name__ == "__main__":
     parser.add_argument("--standalone", action="store_true", help="Run in standalone mode")
     parser.add_argument("--script", action="store_true", help="Run in script mode using configuration from a JSON file")
     parser.add_argument("--config", type=str, help="Path to JSON configuration file (required when using --script)")
+    parser.add_argument(
+        "--analysts",
+        type=str,
+        help="Comma-separated list of analysts to use (bypasses interactive selection)"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Model name to use (bypasses interactive selection)"
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Run in non-interactive mode with command line arguments"
+    )
     
     args = parser.parse_args()
 
     # Check if script mode requires a config file
     if args.script and not args.config:
         parser.error("--script mode requires a --config JSON file")
+    
+    # Check if non-interactive mode has required arguments
+    if args.non_interactive and not all([args.tickers, args.analysts, args.model]):
+        parser.error("Non-interactive mode requires --tickers, --analysts, and --model arguments")
     
     # Load configuration from JSON file if in script mode
     if args.script:
@@ -254,6 +273,41 @@ if __name__ == "__main__":
         except (ValueError, FileNotFoundError) as e:
             print(f"{Fore.RED}Error loading configuration: {e}{Style.RESET_ALL}")
             sys.exit(1)
+    # Non-interactive mode with command line arguments
+    elif args.non_interactive:
+        # Parse tickers from comma-separated string
+        tickers = [ticker.strip() for ticker in args.tickers.split(",")]
+        print(f"\nAnalyzing tickers: {', '.join(Fore.YELLOW + ticker + Style.RESET_ALL for ticker in tickers)}\n")
+        
+        # Parse analysts from comma-separated string
+        selected_analysts = [analyst.strip() for analyst in args.analysts.split(",")]
+        
+        # Validate analysts
+        valid_analysts = set(key for key in ANALYST_CONFIG.keys())
+        invalid_analysts = [analyst for analyst in selected_analysts if analyst not in valid_analysts]
+        if invalid_analysts:
+            print(f"{Fore.RED}Error: Invalid analysts: {', '.join(invalid_analysts)}{Style.RESET_ALL}")
+            print(f"Valid options are: {', '.join(valid_analysts)}")
+            sys.exit(1)
+            
+        print(f"\nSelected analysts: {', '.join(Fore.GREEN + choice.title().replace('_', ' ') + Style.RESET_ALL for choice in selected_analysts)}\n")
+        
+        # Validate model
+        model_choice = args.model
+        valid_models = [model.model_name for model in AVAILABLE_MODELS]
+        if model_choice not in valid_models:
+            print(f"{Fore.RED}Error: Invalid model: {model_choice}{Style.RESET_ALL}")
+            print(f"Valid options are: {', '.join(valid_models)}")
+            sys.exit(1)
+            
+        # Get model info
+        model_info = get_model_info(model_choice)
+        if model_info:
+            model_provider = model_info.provider.value
+            print(f"\nSelected {Fore.CYAN}{model_provider}{Style.RESET_ALL} model: {Fore.GREEN + Style.BRIGHT}{model_choice}{Style.RESET_ALL}\n")
+        else:
+            model_provider = "Unknown"
+            print(f"\nSelected model: {Fore.GREEN + Style.BRIGHT}{model_choice}{Style.RESET_ALL}\n")
     else:
         # Parse tickers from comma-separated string
         tickers = [ticker.strip() for ticker in args.tickers.split(",")]
