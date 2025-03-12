@@ -16,9 +16,9 @@ from agents.warren_buffett import warren_buffett_agent
 from graph.state import AgentState
 from agents.valuation import valuation_agent
 from utils.display import print_trading_output
-from utils.analysts import ANALYST_ORDER, get_analyst_nodes
+from utils.analysts import ANALYST_ORDER, get_analyst_nodes, ANALYST_CONFIG
 from utils.progress import progress
-from llm.models import LLM_ORDER, get_model_info
+from llm.models import LLM_ORDER, get_model_info, AVAILABLE_MODELS
 
 import argparse
 from datetime import datetime

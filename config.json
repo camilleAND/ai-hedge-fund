@@ -1,0 +1,18 @@
+{
+	"tickers": ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"],
+	"analysts": [
+		"warren_buffett",
+		"charlie_munger",
+		"bill_ackman",
+		"technical_analyst",
+		"fundamentals_analyst",
+		"sentiment_analyst"
+	],
+	"model": "gpt-4o",
+	"start_date": "2023-01-01",
+	"end_date": "2023-12-31",
+	"show_reasoning": true,
+	"show_agent_graph": false,
+	"initial_cash": 100000.0,
+	"margin_requirement": 0.0
+}
