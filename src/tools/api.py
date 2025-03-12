@@ -22,6 +22,24 @@ from data.models import (
 # Global cache instance
 _cache = get_cache()
 
+# Convert AlphaVantage data format to our Price model
+def convert_alphavantage_prices(ticker: str, data: dict) -> PriceResponse:
+    """Convert AlphaVantage time series data to our Price model format."""
+    prices = []
+    
+    for date, price_data in data['Time Series (Daily)'].items():
+        # AlphaVantage prefixes fields with numbers
+        price = Price(
+            open=float(price_data['1. open']),
+            high=float(price_data['2. high']),
+            low=float(price_data['3. low']),
+            close=float(price_data['4. close']),
+            volume=int(price_data['5. volume']),
+            time=date
+        )
+        prices.append(price)
+    
+    return PriceResponse(ticker=ticker, prices=prices)
 
 def get_prices(ticker: str, start_date: str, end_date: str) -> list[Price]:
     """Fetch price data from cache or API."""
@@ -31,27 +49,31 @@ def get_prices(ticker: str, start_date: str, end_date: str) -> list[Price]:
         filtered_data = [Price(**price) for price in cached_data if start_date <= price["time"] <= end_date]
         if filtered_data:
             return filtered_data
+    api_key = os.environ.get("ALPHA_VANTAGE_API_KEY")
 
-    # If not in cache or no data in range, fetch from API
-    headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
-
-    url = f"https://api.financialdatasets.ai/prices/?ticker={ticker}&interval=day&interval_multiplier=1&start_date={start_date}&end_date={end_date}"
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
-
-    # Parse response with Pydantic model
-    price_response = PriceResponse(**response.json())
+    url = f'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&outputsize=compact&apikey={api_key}'
+    response = requests.get(url)
+    data = response.json()
+    
+    if 'Error Message' in data:
+        raise Exception(f"Error fetching data from AlphaVantage: {data['Error Message']}")
+    
+    if 'Time Series (Daily)' not in data:
+        raise Exception(f"Unexpected response format from AlphaVantage: {data}")
+    
+    # Convert to our format
+    price_response = convert_alphavantage_prices(ticker, data)
     prices = price_response.prices
-
-    if not prices:
+    
+    # Filter by date range
+    filtered_prices = [p for p in prices if start_date <= p.time <= end_date]
+    
+    if not filtered_prices:
         return []
-
+    
     # Cache the results as dicts
     _cache.set_prices(ticker, [p.model_dump() for p in prices])
-    return prices
+    return filtered_prices
 
 def safe_float(value, default=0.0):
     """Convert value to float safely, returning default if conversion fails."""
@@ -83,6 +105,7 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
     income_url = f"https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={ticker}&apikey={api_key}"
     balance_url = f"https://www.alphavantage.co/query?function=BALANCE_SHEET&symbol={ticker}&apikey={api_key}"
     cashflow_url = f"https://www.alphavantage.co/query?function=CASH_FLOW&symbol={ticker}&apikey={api_key}"
+    earnings_url = f"https://www.alphavantage.co/query?function=EARNINGS&symbol={ticker}&apikey={api_key}"
     
     print("balance_url", balance_url)
     # Fetch data from Alpha Vantage API
@@ -94,6 +117,8 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
         balance_data = requests.get(balance_url).json()
         time.sleep(0.2)
         cashflow_data = requests.get(cashflow_url).json()
+        time.sleep(0.2)
+        earnings_data = requests.get(earnings_url).json()
     except Exception as e:
         print(f"Error fetching data from Alpha Vantage: {e}")
         return []
@@ -118,6 +143,7 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
     # Also get the corresponding balance and cashflow reports
     balance_reports = balance_data.get("quarterlyReports", []) if use_quarterly else balance_data.get("annualReports", [])
     cashflow_reports = cashflow_data.get("quarterlyReports", []) if use_quarterly else cashflow_data.get("annualReports", [])
+    earnings_reports = earnings_data.get("quarterlyEarnings", []) if use_quarterly else earnings_data.get("annualEarnings", [])
     
     # Limit the number of reports
     reports_to_use = reports_to_use[:limit]
@@ -149,6 +175,8 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
                               if b.get("fiscalDateEnding") == report_date), {})
         matching_cashflow = next((c for c in cashflow_reports 
                                if c.get("fiscalDateEnding") == report_date), {})
+        matching_earnings = next((e for e in earnings_reports 
+                               if e.get("fiscalDateEnding") == report_date), {})
         
         if not matching_balance or not matching_cashflow:
             print(f"Warning: Missing data for {report_date}, skipping...")
@@ -181,6 +209,12 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
             eps = safe_float(report.get("reportedEPS"))
             if eps == 0 and net_income > 0 and shares_outstanding > 0:
                 eps = net_income / shares_outstanding
+            
+            # Get EPS from earnings data if available
+            if matching_earnings:
+                reported_eps = safe_float(matching_earnings.get("reportedEPS"))
+                if reported_eps > 0:
+                    eps = reported_eps
             
             # Calculate period-specific market cap (adjust if historical)
             # This is an approximation - in a real system, you'd use historical price data
@@ -231,6 +265,9 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
                 ticker=ticker,
                 report_period=report_date,
                 period=period,
+                revenue=revenue,
+                operating_income=operating_income,
+                ebitda=ebitda,
                 currency=currency,
                 market_cap=market_cap,
                 enterprise_value=enterprise_value,
@@ -285,30 +322,53 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
     results.sort(key=lambda x: x.report_period, reverse=True)
     
     # Calculate growth metrics by comparing sequential periods
+    # Calculate growth metrics by comparing periods
     for i in range(1, len(results)):
         try:
-            current = results[i]  # Older period
-            previous = results[i-1]  # More recent period
-            
-            # Note: Growth is calculated as (old - new) / new for YoY or sequential comparisons
-            # This gives negative values for actual growth (which makes sense in financial terms)
-            
-            # Calculate period-over-period growth rates for raw values
-            current.revenue_growth = (current.revenue_growth - previous.revenue_growth) / previous.revenue_growth if previous.revenue_growth else 0
-            current.earnings_growth = (current.earnings_growth - previous.earnings_growth) / previous.earnings_growth if previous.earnings_growth else 0
-            
-            # Per-share metrics growth
-            current.book_value_growth = (current.book_value_per_share - previous.book_value_per_share) / previous.book_value_per_share if previous.book_value_per_share else 0
-            current.earnings_per_share_growth = (current.earnings_per_share - previous.earnings_per_share) / previous.earnings_per_share if previous.earnings_per_share else 0
-            current.free_cash_flow_growth = (current.free_cash_flow_per_share - previous.free_cash_flow_per_share) / previous.free_cash_flow_per_share if previous.free_cash_flow_per_share else 0
-            
-            # Other financial metrics growth
-            current.operating_income_growth = (current.operating_margin - previous.operating_margin) / previous.operating_margin if previous.operating_margin else 0
-            current.ebitda_growth = 0  # Need EBITDA values from sequential periods
-            
+            current = results[i-1]  # More recent period
+            previous = results[i]   # Older period
+
+            # Earnings growth
+            if previous.earnings_per_share > 0:
+                current.earnings_growth = (
+                    (current.earnings_per_share - previous.earnings_per_share) / previous.earnings_per_share
+                )
+
+            # Revenue growth
+            if current.revenue > 0 and previous.revenue > 0:
+                current.revenue_growth = (
+                    (current.revenue - previous.revenue) / previous.revenue
+                )
+
+            # Book value growth (per share)
+            if previous.book_value_per_share > 0:
+                current.book_value_growth = (
+                    (current.book_value_per_share - previous.book_value_per_share) / previous.book_value_per_share
+                )
+
+            # Free cash flow growth (per share)
+            if previous.free_cash_flow_per_share > 0:
+                current.free_cash_flow_growth = (
+                    (current.free_cash_flow_per_share - previous.free_cash_flow_per_share)
+                    / previous.free_cash_flow_per_share
+                )
+
+            # Operating income growth
+            if previous.operating_income > 0:
+                current.operating_income_growth = (
+                    (current.operating_income - previous.operating_income) / previous.operating_income
+                )
+
+            # EBITDA growth
+            if previous.ebitda > 0:
+                current.ebitda_growth = (
+                    (current.ebitda - previous.ebitda) / previous.ebitda
+                )
+
         except Exception as e:
-            print(f"Error calculating growth metrics: {e}")
+            print(f"[ERROR] Growth calculation failed between {current.report_period} and {previous.report_period}: {e}")
             continue
+
     
     return results
 
@@ -468,123 +528,154 @@ def get_insider_trades(
     start_date: str | None = None,
     limit: int = 1000,
 ) -> list[InsiderTrade]:
-    """Fetch insider trades from cache or API."""
-    # Check cache first
-    if cached_data := _cache.get_insider_trades(ticker):
-        # Filter cached data by date range
-        filtered_data = [InsiderTrade(**trade) for trade in cached_data 
-                        if (start_date is None or (trade.get("transaction_date") or trade["filing_date"]) >= start_date)
-                        and (trade.get("transaction_date") or trade["filing_date"]) <= end_date]
-        filtered_data.sort(key=lambda x: x.transaction_date or x.filing_date, reverse=True)
-        if filtered_data:
-            return filtered_data
-
-    # If not in cache or insufficient data, fetch from API
-    headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
-
-    all_trades = []
-    current_end_date = end_date
+    """
+    Fetch insider trades data from Alpha Vantage API.
     
-    while True:
-        url = f"https://api.financialdatasets.ai/insider-trades/?ticker={ticker}&filing_date_lte={current_end_date}"
-        if start_date:
-            url += f"&filing_date_gte={start_date}"
-        url += f"&limit={limit}"
+    Args:
+        ticker (str): The stock ticker symbol
+        end_date (str): End date for filtering trades (format: YYYY-MM-DD)
+        start_date (str, optional): Start date for filtering trades (format: YYYY-MM-DD)
+        limit (int, optional): Maximum number of transactions to return. Defaults to 1000.
         
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
+    Returns:
+        list[InsiderTrade]: List of insider trades
+    """
+    # Check if we have cached data
+    cached_trades = _cache.get_insider_trades(ticker)
+    if cached_trades:
+        return [InsiderTrade(**trade) for trade in cached_trades]
+    
+    api_key = os.environ.get("ALPHA_VANTAGE_API_KEY")
+    if not api_key:
+        raise ValueError("ALPHA_VANTAGE_API_KEY environment variable not set")
         
-        data = response.json()
-        response_model = InsiderTradeResponse(**data)
-        insider_trades = response_model.insider_trades
+    url = f"https://www.alphavantage.co/query?function=INSIDER_TRANSACTIONS&symbol={ticker}&apikey={api_key}"
+    response = requests.get(url)
+    
+    if response.status_code != 200:
+        raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
         
-        if not insider_trades:
-            break
-            
-        all_trades.extend(insider_trades)
-        
-        # Only continue pagination if we have a start_date and got a full page
-        if not start_date or len(insider_trades) < limit:
-            break
-            
-        # Update end_date to the oldest filing date from current batch for next iteration
-        current_end_date = min(trade.filing_date for trade in insider_trades).split('T')[0]
-        
-        # If we've reached or passed the start_date, we can stop
-        if current_end_date <= start_date:
-            break
-
-    if not all_trades:
-        return []
-
+    data = response.json()
+    
+    transactions = []
+    if 'data' in data:
+        for row in data['data'][:limit]:
+            print(row)
+            try:
+                transaction = InsiderTrade( 
+                    ticker = row['ticker'],
+                    issuer = row['ticker'],
+                    name = row['executive'],
+                    title = row['executive_title'],
+                    is_board_director = True if 'Director' in row['executive_title'] else False,
+                    transaction_date = row['transaction_date'],
+                    transaction_shares = float(row['shares']) * (1 if row['acquisition_or_disposal'] == 'A' else -1),    
+                    transaction_price_per_share = float(row['share_price']) if row['share_price'] else None,
+                    transaction_value = float(row['shares']) * float(row['share_price']) if row['shares'] and row['share_price'] else None,
+                    shares_owned_before_transaction = None,
+                    shares_owned_after_transaction = None,
+                    security_title = row['security_type'],
+                    filing_date = row['transaction_date']
+                )
+                
+                # Filter by date if provided
+                if (not start_date or transaction.transaction_date >= start_date) and \
+                   (not end_date or transaction.transaction_date <= end_date):
+                    transactions.append(transaction)
+            except (KeyError, ValueError) as e:
+                print(f"Error processing row: {row} - {e}")
+                continue
+    
     # Cache the results
-    _cache.set_insider_trades(ticker, [trade.model_dump() for trade in all_trades])
-    return all_trades
+    _cache.set_insider_trades(ticker, [trade.model_dump() for trade in transactions])
+    
+    return transactions
+
 
 
 def get_company_news(
     ticker: str,
     end_date: str,
     start_date: str | None = None,
-    limit: int = 1000,
+    limit: int = 100,
 ) -> list[CompanyNews]:
-    """Fetch company news from cache or API."""
-    # Check cache first
-    if cached_data := _cache.get_company_news(ticker):
-        # Filter cached data by date range
-        filtered_data = [CompanyNews(**news) for news in cached_data 
-                        if (start_date is None or news["date"] >= start_date)
-                        and news["date"] <= end_date]
-        filtered_data.sort(key=lambda x: x.date, reverse=True)
-        if filtered_data:
-            return filtered_data
-
-    # If not in cache or insufficient data, fetch from API
-    headers = {}
-    if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
-        headers["X-API-KEY"] = api_key
-
+    """
+    Fetch company news from Alpha Vantage API
+    
+    Args:
+        ticker (str): Stock ticker symbol
+        end_date (str): End date in YYYY-MM-DD format
+        start_date (str, optional): Start date in YYYY-MM-DD format. Defaults to None.
+        limit (int, optional): Maximum number of news items per page. Defaults to 100.
+        
+    Returns:
+        list[CompanyNews]: List of company news items
+    """
+    api_key = os.environ.get("ALPHA_VANTAGE_API_KEY")
     all_news = []
-    current_end_date = end_date
+    
+    # Format dates for Alpha Vantage API
+    end_date_formatted = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y%m%dT%H%M")
+    start_date_formatted = None
+    if start_date:
+        start_date_formatted = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y%m%dT%H%M")
+    
+    current_end_date = end_date_formatted
     
     while True:
-        url = f"https://api.financialdatasets.ai/news/?ticker={ticker}&end_date={current_end_date}"
-        if start_date:
-            url += f"&start_date={start_date}"
-        url += f"&limit={limit}"
+        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={ticker}&apikey={api_key}&limit={limit}&time_to={current_end_date}"
+        if start_date_formatted:
+            url += f"&time_from={start_date_formatted}"
         
-        response = requests.get(url, headers=headers)
+        response = requests.get(url)
         if response.status_code != 200:
             raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
         
         data = response.json()
-        response_model = CompanyNewsResponse(**data)
-        company_news = response_model.news
+        if 'feed' not in data or not data['feed']:
+            break
         
-        if not company_news:
+        news_batch = []
+        for news in data['feed']:
+            new_element = CompanyNews(
+                ticker=ticker,
+                title=news['title'],
+                author=news['authors'][0] if news.get('authors') else "",
+                source=news['source'],
+                date=news['time_published'],
+                url=news['url'],
+                sentiment=news['overall_sentiment_label'].lower() if 'overall_sentiment_label' in news else "neutral"
+            )
+            news_batch.append(new_element)
+        
+        if not news_batch:
             break
             
-        all_news.extend(company_news)
+        all_news.extend(news_batch)
         
         # Only continue pagination if we have a start_date and got a full page
-        if not start_date or len(company_news) < limit:
+        if not start_date or len(news_batch) < limit:
             break
             
         # Update end_date to the oldest date from current batch for next iteration
-        current_end_date = min(news.date for news in company_news).split('T')[0]
+        oldest_date = min(news.date for news in news_batch)
+        # Fix the format string to match the Alpha Vantage date format (20240310T0000)
+        current_end_date = datetime.strptime(oldest_date, "%Y%m%dT%H%M%S").strftime("%Y%m%dT%H%M")
         
         # If we've reached or passed the start_date, we can stop
-        if current_end_date <= start_date:
+        if start_date_formatted and current_end_date <= start_date_formatted:
             break
+        
+        # Add a small delay to avoid rate limiting
+        time.sleep(0.2)
 
     if not all_news:
         return []
 
-    # Cache the results
-    _cache.set_company_news(ticker, [news.model_dump() for news in all_news])
+    # Cache the results if _cache is available
+    if '_cache' in globals() and _cache:
+        _cache.set_company_news(ticker, [news.model_dump() for news in all_news])
+        
     return all_news
 
 

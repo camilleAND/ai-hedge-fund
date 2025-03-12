@@ -19,6 +19,9 @@ class FinancialMetrics(BaseModel):
     ticker: str
     report_period: str
     period: str
+    revenue: float | None
+    operating_income: float | None
+    ebitda: float | None
     currency: str
     market_cap: float | None
     enterprise_value: float | None
