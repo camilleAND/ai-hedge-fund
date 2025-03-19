@@ -84,6 +84,27 @@ def safe_float(value, default=0.0):
     except (ValueError, TypeError):
         return default
 
+def fetch_historical_prices(symbol, api_key):
+    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={symbol}&apikey={api_key}&outputsize=full"
+    response = requests.get(url)
+    data = response.json()
+    if "Time Series (Daily)" not in data:
+        raise ValueError(f"Error fetching historical prices: {data.get('Error Message', 'Unknown error')}")
+    return data["Time Series (Daily)"]
+
+# Function to compute market cap history
+def compute_market_cap_history(symbol, shares_outstanding, api_key):
+    # Fetch data from APIs
+    historical_prices = fetch_historical_prices(symbol, api_key)
+    
+    # Compute market caps
+    market_cap_history = {}
+    for date, price_data in historical_prices.items():
+        adjusted_close = float(price_data["5. adjusted close"])
+        market_cap = adjusted_close * shares_outstanding
+        market_cap_history[date] = market_cap
+    return market_cap_history
+
 def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: str = "ttm", limit: int = 10) -> List[FinancialMetrics]:
     """
     Get financial metrics from Alpha Vantage API.
@@ -136,17 +157,103 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
     use_quarterly = period.lower() in ["quarterly", "ttm"]
     
     # Get reports based on period
-    annual_reports = income_data.get("annualReports", [])
-    quarterly_reports = income_data.get("quarterlyReports", [])
-    reports_to_use = quarterly_reports if use_quarterly else annual_reports
+    if period == 'annual':
+        income_reports = income_data.get('annualReports', [])
+        balance_reports = balance_data.get('annualReports', [])
+        cashflow_reports = cashflow_data.get('annualReports', [])
+        earnings_reports = earnings_data.get('annualEarnings', [])
+    else:
+        income_reports = income_data.get('quarterlyReports', [])
+        balance_reports = balance_data.get('quarterlyReports', [])
+        cashflow_reports = cashflow_data.get('quarterlyReports', [])
+        earnings_reports = earnings_data.get('quarterlyEarnings', [])
+
+    # Convert to DataFrames
+    df_income = pd.DataFrame(income_reports)
+    df_balance = pd.DataFrame(balance_reports)
+    df_cashflow = pd.DataFrame(cashflow_reports)
+    df_earnings = pd.DataFrame(earnings_reports)
+
+    # Filter by end date
+    df_income = df_income[df_income['fiscalDateEnding'] <= end_date]
+    df_balance = df_balance[df_balance['fiscalDateEnding'] <= end_date]
+    df_cashflow = df_cashflow[df_cashflow['fiscalDateEnding'] <= end_date]
+    df_earnings = df_earnings[df_earnings['fiscalDateEnding'] <= end_date]
+
+    # Merge datasets
+    merged_data = pd.merge(
+        df_income, 
+        df_balance[[col for col in df_balance.columns if col not in df_income.columns or col == 'fiscalDateEnding']],
+        on='fiscalDateEnding', 
+        how='inner'
+    )
+    merged_data = pd.merge(
+        merged_data,
+        df_cashflow[[col for col in df_cashflow.columns if col not in merged_data.columns or col == 'fiscalDateEnding']],
+        on='fiscalDateEnding',
+        how='inner'
+    )
+    merged_data = pd.merge(
+        merged_data,
+        df_earnings[[col for col in df_earnings.columns if col not in merged_data.columns or col == 'fiscalDateEnding']],
+        on='fiscalDateEnding',
+        how='inner'
+    )
     
-    # Also get the corresponding balance and cashflow reports
-    balance_reports = balance_data.get("quarterlyReports", []) if use_quarterly else balance_data.get("annualReports", [])
-    cashflow_reports = cashflow_data.get("quarterlyReports", []) if use_quarterly else cashflow_data.get("annualReports", [])
-    earnings_reports = earnings_data.get("quarterlyEarnings", []) if use_quarterly else earnings_data.get("annualEarnings", [])
+    # Convert numeric columns to float if possible
+    numeric_data = merged_data
     
-    # Limit the number of reports
-    reports_to_use = reports_to_use[:limit]
+    for col in merged_data.columns:
+        try:
+            merged_data[col] = pd.to_numeric(merged_data[col])
+        except:
+            pass
+    # Limit number of results
+    numeric_data.replace(to_replace=['None', None], value=0, inplace=True)
+
+    # for quarterly data, we need to calculate the rolling sum of the last 4 quarters only for numeric columns
+    # This step is very important to compute TTM
+    if period != 'annual':
+        numeric_cols = [col for col in numeric_data.columns if numeric_data[col].dtype in ['int64', 'float64', 'int32', 'float32']]
+        cols_to_remove = ['SharesOutstanding','commonStockSharesOutstanding', 'totalShareholderEquity', 'cashAndCashEquivalentsAtCarryingValue', 'totalCurrentAssets', 'totalCurrentLiabilities', 'totalLiabilities', 'totalShareholderEquity', 'totalAssets']
+        numeric_cols = [col for col in numeric_cols if col not in cols_to_remove]
+        non_numeric_cols = [col for col in numeric_data.columns if col not in numeric_cols]
+        
+        # Calculate rolling sum for numeric columns
+        numeric_data_sum = numeric_data[numeric_cols][::-1].rolling(window=4, min_periods=1).sum()[::-1]
+        
+        # Replace numeric columns with their rolling sums
+        for col in numeric_cols:
+            numeric_data[col] = numeric_data_sum[col]
+            
+        # Keep the non-numeric columns as they are
+        numeric_data = numeric_data[numeric_cols + non_numeric_cols]
+
+    numeric_data = numeric_data.head(limit)
+
+    # Calculate financial metrics
+    numeric_data['taux_d_imposition_effectif'] = numeric_data['incomeTaxExpense'] / numeric_data['incomeBeforeTax']
+    numeric_data['NOPAT'] = numeric_data['ebit'] * (1 - numeric_data['taux_d_imposition_effectif'])
+
+    #numeric_data['goodwill_and_intangible_assets'] = numeric_data['goodwill'] + numeric_data['intangibleAssets']
+    
+    # Handle invalid tax rates
+    numeric_data['NOPAT'] = numeric_data['NOPAT'].where(
+        numeric_data['taux_d_imposition_effectif'] >= 0, 
+        numeric_data['ebit']
+    )
+    
+    # Calculate Invested Capital
+    numeric_data['Invested_Capital'] = (
+        numeric_data['totalAssets'] - 
+        numeric_data['totalCurrentLiabilities']
+    )
+    
+    # Calculate ROIC
+    numeric_data['ROIC'] = numeric_data['NOPAT'] / numeric_data['Invested_Capital']
+
+    # Use the numeric_data DataFrame to compute financial metrics
+    results = []
     
     # Get current share price from overview
     share_price = safe_float(overview_data.get("Price", 0))
@@ -158,107 +265,77 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
             share_price = market_cap / shares_outstanding
     
     # Get base market data from overview
-    base_market_cap = safe_float(overview_data.get("MarketCapitalization", 0))
     shares_outstanding = safe_float(overview_data.get("SharesOutstanding", 0))
     currency = overview_data.get("Currency", "USD")
+
+    # Market cap history
+    market_cap_history = compute_market_cap_history(ticker, shares_outstanding, api_key)
     
-    # Process each report
-    for report in reports_to_use:
-        report_date = report.get("fiscalDateEnding", "")
+    # Process each row in numeric_data
+    for _, row in numeric_data.iterrows():
+        report_date = row.get("fiscalDateEnding", "")
         
         # Skip if report date is after end_date
         if end_date and report_date > end_date:
             continue
             
-        # Find matching balance sheet and cash flow data for this report period
-        matching_balance = next((b for b in balance_reports 
-                              if b.get("fiscalDateEnding") == report_date), {})
-        matching_cashflow = next((c for c in cashflow_reports 
-                               if c.get("fiscalDateEnding") == report_date), {})
-        matching_earnings = next((e for e in earnings_reports 
-                               if e.get("fiscalDateEnding") == report_date), {})
-        
-        if not matching_balance or not matching_cashflow:
-            print(f"Warning: Missing data for {report_date}, skipping...")
-            continue
-        
         try:
-            # Basic financial values with safe conversion
-            revenue = safe_float(report.get("totalRevenue"))
-            ebitda = safe_float(report.get("ebitda"))
-            net_income = safe_float(report.get("netIncome"))
-            operating_income = safe_float(report.get("operatingIncome"))
-            gross_profit = safe_float(report.get("grossProfit"))
-            cost_of_revenue = safe_float(report.get("costOfRevenue"))
-            interest_expense = safe_float(report.get("interestExpense"))
+            # Extract financial values from the numeric_data DataFrame
+            revenue = safe_float(row.get("totalRevenue"))
+            operating_income = safe_float(row.get("operatingIncome"))
+            net_income = safe_float(row.get("netIncome"))
+            gross_profit = safe_float(row.get("grossProfit"))
+            cost_of_revenue = safe_float(row.get("costOfRevenue"))
+            interest_expense = safe_float(row.get("interestExpense"))
+            depreciation_amortization = safe_float(row.get("depreciationAndAmortization"))
+            ebitda = operating_income + depreciation_amortization
             
-            total_assets = safe_float(matching_balance.get("totalAssets"))
-            total_equity = safe_float(matching_balance.get("totalShareholderEquity"))
-            total_current_assets = safe_float(matching_balance.get("totalCurrentAssets"))
-            total_current_liabilities = safe_float(matching_balance.get("totalCurrentLiabilities"))
-            inventory = safe_float(matching_balance.get("inventory"))
-            receivables = safe_float(matching_balance.get("currentNetReceivables"))
-            total_debt = safe_float(matching_balance.get("shortLongTermDebtTotal"))
-            cash = safe_float(matching_balance.get("cashAndShortTermInvestments"))
+            total_assets = safe_float(row.get("totalAssets"))
+            total_equity = safe_float(row.get("totalShareholderEquity"))
+            total_current_assets = safe_float(row.get("totalCurrentAssets"))
+            total_current_liabilities = safe_float(row.get("totalCurrentLiabilities"))
+            inventory = safe_float(row.get("inventory"))
+            receivables = safe_float(row.get("currentNetReceivables"))
+            total_debt = safe_float(row.get("shortLongTermDebtTotal"))
+            cash = safe_float(row.get("cashAndShortTermInvestments"))
             
-            operating_cashflow = safe_float(matching_cashflow.get("operatingCashflow"))
-            capital_expenditures = safe_float(matching_cashflow.get("capitalExpenditures"))
+            operating_cashflow = safe_float(row.get("operatingCashflow"))
+            capital_expenditures = safe_float(row.get("capitalExpenditures"))
             free_cash_flow = operating_cashflow - capital_expenditures
+            roic = safe_float(row.get("ROIC"))
             
             # EPS - try multiple sources
-            eps = safe_float(report.get("reportedEPS"))
+            eps = safe_float(row.get("reportedEPS"))
             if eps == 0 and net_income > 0 and shares_outstanding > 0:
                 eps = net_income / shares_outstanding
             
-            # Get EPS from earnings data if available
-            if matching_earnings:
-                reported_eps = safe_float(matching_earnings.get("reportedEPS"))
-                if reported_eps > 0:
-                    eps = reported_eps
-            
-            # Calculate period-specific market cap (adjust if historical)
-            # This is an approximation - in a real system, you'd use historical price data
-            current_year = datetime.now().year
-            report_year = int(report_date.split('-')[0])
-            years_diff = current_year - report_year
-            
-            # Adjust market cap if historical (simplistic approach)
-            if years_diff > 0 and eps > 0:
-                # Assume P/E ratio has been somewhat consistent
-                current_pe = safe_float(overview_data.get("PERatio", 25))  # Default to 25 if not available
-                market_cap = eps * shares_outstanding * current_pe
-            else:
-                market_cap = base_market_cap
+            # Use market cap history
+            market_cap = market_cap_history.get(report_date, 0)
             
             # Enterprise value
             enterprise_value = market_cap + total_debt - cash
             
             # Calculate financial ratios
-            pe_ratio = market_cap / net_income if net_income > 0 else safe_float(overview_data.get("PERatio", 0))
+            pe_ratio = (market_cap/shares_outstanding)/eps if eps > 0 else 0
             pb_ratio = market_cap / total_equity if total_equity > 0 else safe_float(overview_data.get("PriceToBookRatio", 0))
             ps_ratio = market_cap / revenue if revenue > 0 else safe_float(overview_data.get("PriceToSalesRatioTTM", 0))
             
             book_value_per_share = total_equity / shares_outstanding if shares_outstanding > 0 else 0
             free_cash_flow_per_share = free_cash_flow / shares_outstanding if shares_outstanding > 0 else 0
             
-            # Calculate ROIC (Return on Invested Capital)
-            # ROIC = NOPAT / Invested Capital
-            # NOPAT = Operating Income * (1 - Tax Rate)
-            # Invested Capital = Total Assets - Current Liabilities
-            
             # Estimate tax rate (if available)
-            income_tax = safe_float(report.get("incomeTaxExpense"))
-            income_before_tax = safe_float(report.get("incomeBeforeTax"))
-            tax_rate = income_tax / income_before_tax if income_before_tax > 0 else 0.25  # Default to 25% if not available
+            #income_tax = safe_float(row.get("incomeTaxExpense"))
+            #income_before_tax = safe_float(row.get("incomeBeforeTax"))
+            #tax_rate = income_tax / income_before_tax if income_before_tax > 0 else 0.25  # Default to 25% if not available
             
             # Calculate NOPAT
-            nopat = operating_income * (1 - tax_rate)
+            #nopat = operating_income * (1 - tax_rate)
             
             # Calculate Invested Capital
-            invested_capital = total_assets - total_current_liabilities
+            #invested_capital = total_assets - total_current_liabilities
             
             # Calculate ROIC
-            roic = nopat / invested_capital if invested_capital > 0 else 0
+            #roic = nopat / invested_capital if invested_capital > 0 else 0
             
             # Create financial metrics object
             metrics = FinancialMetrics(
@@ -319,9 +396,8 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
             continue
     
     # Sort results by report_period in descending order (most recent first)
-    results.sort(key=lambda x: x.report_period, reverse=True)
+    #results.sort(key=lambda x: x.report_period, reverse=True)
     
-    # Calculate growth metrics by comparing sequential periods
     # Calculate growth metrics by comparing periods
     for i in range(1, len(results)):
         try:
@@ -333,6 +409,15 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
                 current.earnings_growth = (
                     (current.earnings_per_share - previous.earnings_per_share) / previous.earnings_per_share
                 )
+            # Earnings per share growth
+            if previous.earnings_per_share > 0:
+                current.earnings_per_share_growth = (
+                    (current.earnings_per_share - previous.earnings_per_share) / previous.earnings_per_share
+                )
+            
+            # Peg ratio from earnings growth
+            if previous.earnings_per_share > 0:
+                current.peg_ratio = current.price_to_earnings_ratio / current.earnings_growth
 
             # Revenue growth
             if current.revenue > 0 and previous.revenue > 0:
@@ -369,9 +454,7 @@ def get_financial_metrics(ticker: str, end_date: Optional[str] = None, period: s
             print(f"[ERROR] Growth calculation failed between {current.report_period} and {previous.report_period}: {e}")
             continue
 
-    
-    return results
-
+    return results[:limit]
 
 def search_line_items(
     ticker: str,
@@ -409,6 +492,11 @@ def search_line_items(
     response_cashflow = requests.get(url_cashflow)
     data_cashflow = response_cashflow.json()
 
+    # Fetch earnings data
+    url_earnings = f"https://www.alphavantage.co/query?function=EARNINGS&symbol={ticker}&apikey={api_key}"
+    response_earnings = requests.get(url_earnings)
+    data_earnings = response_earnings.json()
+
     # Fetch overview data   
     url_overview = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={api_key}"
     response_overview = requests.get(url_overview)
@@ -419,18 +507,25 @@ def search_line_items(
         income_reports = data_income.get('annualReports', [])
         balance_reports = data_balance.get('annualReports', [])
         cashflow_reports = data_cashflow.get('annualReports', [])
+        earnings_reports = data_earnings.get('annualEarnings', [])
     else:
         income_reports = data_income.get('quarterlyReports', [])
         balance_reports = data_balance.get('quarterlyReports', [])
         cashflow_reports = data_cashflow.get('quarterlyReports', [])
+        earnings_reports = data_earnings.get('quarterlyEarnings', [])
+
     # Convert to DataFrames
     df_income = pd.DataFrame(income_reports)
     df_balance = pd.DataFrame(balance_reports)
     df_cashflow = pd.DataFrame(cashflow_reports)
+    df_earnings = pd.DataFrame(earnings_reports)
+
     # Filter by end date
     df_income = df_income[df_income['fiscalDateEnding'] <= end_date]
     df_balance = df_balance[df_balance['fiscalDateEnding'] <= end_date]
     df_cashflow = df_cashflow[df_cashflow['fiscalDateEnding'] <= end_date]
+    df_earnings = df_earnings[df_earnings['fiscalDateEnding'] <= end_date]
+
     # Merge datasets
     merged_data = pd.merge(
         df_income, 
@@ -441,6 +536,12 @@ def search_line_items(
     merged_data = pd.merge(
         merged_data,
         df_cashflow[[col for col in df_cashflow.columns if col not in merged_data.columns or col == 'fiscalDateEnding']],
+        on='fiscalDateEnding',
+        how='inner'
+    )
+    merged_data = pd.merge(
+        merged_data,
+        df_earnings[[col for col in df_earnings.columns if col not in merged_data.columns or col == 'fiscalDateEnding']],
         on='fiscalDateEnding',
         how='inner'
     )
@@ -476,8 +577,27 @@ def search_line_items(
     numeric_data['ROIC'] = numeric_data['NOPAT'] / numeric_data['Invested_Capital']
     
     # Limit number of results
-    numeric_data = numeric_data.head(limit)
     numeric_data.replace(to_replace=['None', None], value=0, inplace=True)
+
+    # for quarterly data, we need to calculate the rolling sum of the last 4 quarters only for numeric columns
+    # This step is very important to compute TTM
+    if period != 'annual':
+        numeric_cols = [col for col in numeric_data.columns if numeric_data[col].dtype in ['int64', 'float64', 'int32', 'float32']]
+        cols_to_remove = ['capitalExpenditures', 'commonStockSharesOutstanding', 'totalShareholderEquity', 'cashAndCashEquivalentsAtCarryingValue', 'totalCurrentAssets', 'totalCurrentLiabilities', 'totalLiabilities', 'totalShareholderEquity', 'totalAssets']
+        numeric_cols = [col for col in numeric_cols if col not in cols_to_remove]
+        non_numeric_cols = [col for col in numeric_data.columns if col not in numeric_cols]
+        
+        # Calculate rolling sum for numeric columns
+        numeric_data_sum = numeric_data[numeric_cols][::-1].rolling(window=4, min_periods=1).sum()[::-1]
+        
+        # Replace numeric columns with their rolling sums
+        for col in numeric_cols:
+            numeric_data[col] = numeric_data_sum[col]
+            
+        # Keep the non-numeric columns as they are
+        numeric_data = numeric_data[numeric_cols + non_numeric_cols]
+
+    numeric_data = numeric_data.head(limit)
 
     # Convert to LineItem objects
     results = []
@@ -485,20 +605,34 @@ def search_line_items(
         try:
             item = LineItem(
                 ticker=ticker,
-                report_period=row['fiscalDateEnding'],
+                report_period=row.get('fiscalDateEnding', ''),  # Ensure a default empty value for robustness.
                 period=period,
                 currency=row.get('reportedCurrency_x', 'USD'),
-                return_on_invested_capital=row.get('ROIC'),
-                operating_margin=float(row.get('operatingIncome', 0)) / float(row.get('totalRevenue', 1)) if float(row.get('totalRevenue', 0)) > 0 else 0,
-                working_capital=float(row.get('totalCurrentAssets', 0)) - float(row.get('totalCurrentLiabilities', 0)),
-                gross_margin=float(row.get('grossProfit', 0)) / float(row.get('totalRevenue', 1)) if float(row.get('totalRevenue', 0)) > 0 else 0,
-                debt_to_equity=float(row.get('totalLiabilities', 0)) / float(row.get('totalShareholderEquity', 1)) if float(row.get('totalShareholderEquity', 0)) > 0 else 0,
-                ebitda=float(row.get('ebitda', 0)),
-                free_cash_flow=float(row.get('operatingCashflow', 0)) - float(row.get('capitalExpenditures', 0)),
+                earnings_per_share=float(row.get('reportedEPS', 0)), 
+                # Note: EPS computation is commented out but can be applied fallback logic if needed.
+                # float(row.get('netIncome', 0)) / float(row.get('commonStockSharesOutstanding', 1))
+                # if float(row.get('commonStockSharesOutstanding', 0)) > 0 else 0,
+                revenue=float(row.get('totalRevenue', 0)),
+                operating_income=float(row.get('operatingIncome', 0)),
+                operating_expense=float(row.get('operatingExpenses', 0)),
+                ebit=float(row.get('ebit', 0)),
+                research_and_development=float(row.get('researchAndDevelopment', 0)),
+                free_cash_flow=float(row.get('operatingCashflow', 0)) - abs(float(row.get('capitalExpenditures', 0))),
+                # Computation adjusted to match the FCF standard formula: OCF - CapEx
                 net_income=float(row.get('netIncome', 0)),
-                capital_expenditure=float(row.get('capitalExpenditures', 0)),
+                capital_expenditure=-1 * abs(float(row.get('capitalExpenditures', 0))) if 'capitalExpenditures' in row else 0.0,
+                # Ensure CapEx is negative to represent cash outflow consistently.
                 depreciation_and_amortization=float(row.get('depreciationAndAmortization', 0)),
-                dividends_and_other_cash_distributions=float(row.get('dividendPayout', 0)),
+                dividends_and_other_cash_distributions=-1 * abs(float(row.get('dividendPayout', 0))),
+                return_on_invested_capital=row.get('ROIC', 0),  # Ensure default value of 0 is set if not available.
+                operating_margin=(float(row.get('operatingIncome', 0)) / float(row.get('totalRevenue', 1))) 
+                if float(row.get('totalRevenue', 0)) > 0 else 0,
+                working_capital=float(row.get('totalCurrentAssets', 0)) - float(row.get('totalCurrentLiabilities', 0)),
+                gross_margin=(float(row.get('grossProfit', 0)) / float(row.get('totalRevenue', 1))) 
+                if float(row.get('totalRevenue', 0)) > 0 else 0,
+                debt_to_equity=(float(row.get('totalLiabilities', 0)) / float(row.get('totalShareholderEquity', 1)))
+                if float(row.get('totalShareholderEquity', 0)) > 0 else 0,
+                ebitda=float(row.get('ebitda', 0)),
                 goodwill_and_intangible_assets=float(row.get('goodwill', 0)) + float(row.get('intangibleAssets', 0)),
                 shareholders_equity=float(row.get('totalShareholderEquity', 0)),
                 total_debt=float(row.get('shortLongTermDebtTotal', 0)),
@@ -506,16 +640,11 @@ def search_line_items(
                 total_assets=float(row.get('totalAssets', 0)),
                 cash_and_equivalents=float(row.get('cashAndCashEquivalentsAtCarryingValue', 0)),
                 total_liabilities=float(row.get('totalLiabilities', 0)),
-                earnings_per_share=float(row.get('netIncome', 0)) / float(row.get('commonStockSharesOutstanding', 1)) if float(row.get('commonStockSharesOutstanding', 0)) > 0 else 0,
-                revenue=float(row.get('totalRevenue', 0)),
-                operating_income=float(row.get('operatingIncome', 0)),
-                operating_expense=float(row.get('operatingExpenses', 0)),
-                ebit=float(row.get('ebit', 0)),
-                research_and_development=float(row.get('researchAndDevelopment', 0)),
                 book_value_per_share=float(data_overview.get('BookValue', 0)),
                 current_assets=float(row.get('totalCurrentAssets', 0)),
                 current_liabilities=float(row.get('totalCurrentLiabilities', 0)),
             )
+
             results.append(item)
         except Exception as e:
             print(f"Error creating LineItem for {row['fiscalDateEnding']}: {e}")
